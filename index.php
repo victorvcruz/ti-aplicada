@@ -24,7 +24,8 @@ $SNMP_VERSION    = '2c';
 $SNMP_TIMEOUT    = 2;          // segundos
 $SNMP_RETRIES    = 1;
 $REFRESH_SECONDS = 15;         // auto-refresh do dashboard
-$STATE_FILE      = sys_get_temp_dir() . '/nms_state.json';  // cache p/ calcular taxa
+$HISTORY_SIZE    = 30;         // nº de amostras exibidas no histograma
+$STATE_FILE      = sys_get_temp_dir() . '/nms_state.json';  // cache p/ calcular taxa e histórico
 
 // ======================== HELPERS SNMP ========================
 function snmp_cmd(string $bin, string $host, string $community, string $oid, int $timeout, int $retries, string $ver = '2c'): string {
@@ -268,10 +269,78 @@ foreach ($STATIONS as $st) {
     $rates = iface_rates($prev, $metrics['ifaces'], $now);
     $metrics['rates'] = $rates;
 
-    $newState[$st['host']] = ['ts' => $now, 'ifaces' => $ifIndexed];
+    // Atualiza histórico por interface (para o histograma)
+    $history = $prev['history'] ?? [];
+    foreach ($metrics['ifaces'] as $if) {
+        $key = $if['descr'] . '@' . $if['idx'];
+        if (!isset($history[$key])) $history[$key] = [];
+        $r = $rates[$key] ?? null;
+        if ($r !== null && ($r['bps_in'] !== null || $r['bps_out'] !== null)) {
+            $history[$key][] = [
+                'ts'  => $now,
+                'in'  => $r['bps_in']  ?? 0,
+                'out' => $r['bps_out'] ?? 0,
+            ];
+            if (count($history[$key]) > $HISTORY_SIZE) {
+                $history[$key] = array_slice($history[$key], -$HISTORY_SIZE);
+            }
+        }
+    }
+    // remove chaves de interfaces sumidas
+    foreach (array_keys($history) as $k) {
+        if (!isset($ifIndexed[$k])) unset($history[$k]);
+    }
+    $metrics['history'] = $history;
+
+    $newState[$st['host']] = ['ts' => $now, 'ifaces' => $ifIndexed, 'history' => $history];
     $results[] = ['station' => $st, 'm' => $metrics];
 }
 save_state($STATE_FILE, $newState);
+
+/**
+ * Renderiza um histograma SVG (In para cima, Out para baixo).
+ */
+function render_histogram(array $samples, int $capacity, int $w = 380, int $h = 90): string {
+    $mid = $h / 2;
+    // pad histórico à esquerda com zeros
+    $pad = max(0, $capacity - count($samples));
+    $data = array_merge(array_fill(0, $pad, ['in'=>0,'out'=>0]), $samples);
+    $data = array_slice($data, -$capacity);
+
+    $maxIn  = 1; $maxOut = 1;
+    foreach ($data as $d) {
+        $maxIn  = max($maxIn,  $d['in']  ?? 0);
+        $maxOut = max($maxOut, $d['out'] ?? 0);
+    }
+    $peak = max($maxIn, $maxOut, 1);
+
+    $barW  = max(2, floor(($w - 2) / $capacity));
+    $usedW = $barW * $capacity;
+    $ox    = ($w - $usedW) / 2;
+
+    $svg  = '<svg viewBox="0 0 '.$w.' '.$h.'" width="100%" height="'.$h.'" preserveAspectRatio="none" style="display:block;background:#0b1220;border:1px solid #334155;border-radius:6px;">';
+    // grid: linha central + marcas
+    $svg .= '<line x1="0" y1="'.$mid.'" x2="'.$w.'" y2="'.$mid.'" stroke="#334155" stroke-width="1"/>';
+    $svg .= '<line x1="0" y1="'.($mid/2).'" x2="'.$w.'" y2="'.($mid/2).'" stroke="#1e293b" stroke-width="1" stroke-dasharray="2,3"/>';
+    $svg .= '<line x1="0" y1="'.($mid+$mid/2).'" x2="'.$w.'" y2="'.($mid+$mid/2).'" stroke="#1e293b" stroke-width="1" stroke-dasharray="2,3"/>';
+
+    foreach ($data as $i => $d) {
+        $x  = $ox + $i * $barW;
+        $hi = ($d['in']  ?? 0) / $peak * ($mid - 1);
+        $ho = ($d['out'] ?? 0) / $peak * ($mid - 1);
+        if ($hi > 0) {
+            $svg .= '<rect x="'.($x+0.5).'" y="'.($mid-$hi).'" width="'.($barW-1).'" height="'.$hi.'" fill="#38bdf8"/>';
+        }
+        if ($ho > 0) {
+            $svg .= '<rect x="'.($x+0.5).'" y="'.$mid.'" width="'.($barW-1).'" height="'.$ho.'" fill="#22c55e"/>';
+        }
+    }
+    // labels de pico
+    $svg .= '<text x="4" y="10" fill="#94a3b8" font-size="9" font-family="monospace">In pico: '.htmlspecialchars(fmt_bps($maxIn)).'</text>';
+    $svg .= '<text x="4" y="'.($h-3).'" fill="#94a3b8" font-size="9" font-family="monospace">Out pico: '.htmlspecialchars(fmt_bps($maxOut)).'</text>';
+    $svg .= '</svg>';
+    return $svg;
+}
 
 ?><!DOCTYPE html>
 <html lang="pt-BR">
@@ -309,6 +378,13 @@ save_state($STATE_FILE, $newState);
   .status.ok  { background:rgba(34,197,94,.15);  color:var(--ok);  border:1px solid rgba(34,197,94,.4); }
   .status.bad { background:rgba(239,68,68,.15); color:var(--bad); border:1px solid rgba(239,68,68,.4); }
   .err { color:var(--bad); font-size:13px; margin-top:8px; }
+  .iface { margin: 8px 0 12px; }
+  .iface-head { display:flex; justify-content:space-between; align-items:center; font-size:12px; margin-bottom:4px; gap:8px; flex-wrap:wrap; }
+  .iface-name { font-family: monospace; color:var(--text); }
+  .iface-stats { font-family: monospace; font-size:11.5px; }
+  .lg-in, .lg-out { display:inline-block; width:10px; height:10px; border-radius:2px; vertical-align:middle; margin-right:2px; }
+  .lg-in  { background:#38bdf8; }
+  .lg-out { background:#22c55e; }
   footer { text-align:center; color:var(--muted); font-size:12px; padding:16px; }
 </style>
 </head>
@@ -387,29 +463,40 @@ save_state($STATE_FILE, $newState);
         </table>
       <?php endif; ?>
 
-      <div class="section-title">Tráfego nas interfaces</div>
+      <div class="section-title">
+        Tráfego nas interfaces
+        <span style="float:right; font-weight:400; text-transform:none; letter-spacing:0;">
+          <span class="lg-in"></span> In
+          &nbsp;
+          <span class="lg-out"></span> Out
+        </span>
+      </div>
       <?php if (empty($m['ifaces'])): ?>
         <div class="row"><span class="k">Sem interfaces reportadas</span><span>—</span></div>
       <?php else: ?>
-        <table>
-          <thead><tr><th>Interface</th><th class="num">In (taxa)</th><th class="num">Out (taxa)</th><th class="num">Total In</th><th class="num">Total Out</th></tr></thead>
-          <tbody>
-          <?php foreach ($m['ifaces'] as $if):
-              $key = $if['descr'].'@'.$if['idx'];
-              $r = $m['rates'][$key] ?? ['bps_in'=>null,'bps_out'=>null];
-          ?>
-            <tr>
-              <td><?= h($if['descr']) ?></td>
-              <td class="num"><?= fmt_bps($r['bps_in']) ?></td>
-              <td class="num"><?= fmt_bps($r['bps_out']) ?></td>
-              <td class="num"><?= $if['in']  !== null ? fmt_bytes((float)$if['in'])  : '—' ?></td>
-              <td class="num"><?= $if['out'] !== null ? fmt_bytes((float)$if['out']) : '—' ?></td>
-            </tr>
-          <?php endforeach; ?>
-          </tbody>
-        </table>
+        <?php foreach ($m['ifaces'] as $if):
+            $key = $if['descr'].'@'.$if['idx'];
+            $r   = $m['rates'][$key] ?? ['bps_in'=>null,'bps_out'=>null];
+            $hist= $m['history'][$key] ?? [];
+        ?>
+          <div class="iface">
+            <div class="iface-head">
+              <span class="iface-name"><?= h($if['descr']) ?></span>
+              <span class="iface-stats">
+                <span style="color:#38bdf8;">↓ <?= fmt_bps($r['bps_in']) ?></span>
+                &nbsp;·&nbsp;
+                <span style="color:#22c55e;">↑ <?= fmt_bps($r['bps_out']) ?></span>
+                &nbsp;·&nbsp;
+                <span class="k">Σ In <?= $if['in']  !== null ? fmt_bytes((float)$if['in'])  : '—' ?></span>
+                &nbsp;/&nbsp;
+                <span class="k">Σ Out <?= $if['out'] !== null ? fmt_bytes((float)$if['out']) : '—' ?></span>
+              </span>
+            </div>
+            <?= render_histogram($hist, $HISTORY_SIZE) ?>
+          </div>
+        <?php endforeach; ?>
         <div style="font-size:11px; color:var(--muted); margin-top:6px;">
-          Taxa calculada a partir da diferença entre coletas (aguarde 1 refresh após abrir a página).
+          Histograma: cada barra é uma coleta (<?= (int)$REFRESH_SECONDS ?>s). Amostras acumulam até <?= (int)$HISTORY_SIZE ?>.
         </div>
       <?php endif; ?>
 
